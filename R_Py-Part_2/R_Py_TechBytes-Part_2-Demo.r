@@ -88,11 +88,14 @@ suppressPackageStartupMessages(LoadPackages())
 # driver. Before you execute the following statement, replace the variables
 # <HOSTNAME>, <UID>, and <PWD> with the target Vantage system hostname, your
 # database user ID, and password, respectively.
-con <- td_create_context(host = "<HOSTNAME>", dType="native", uid = "<UID>", pwd = "<PWD>")
+# Load configuration from environment variables (set via .env or system env)
+# Source the config.R file from the repo root to load TD_HOST, TD_USER, etc.
+source(file.path(dirname(sys.frame(1)$ofile), '..', 'config.R'))
+con <- td_create_context(host = td_host, dType="native", uid = td_user, pwd = td_password)
 
 # With a Teradata R native driver connection, submit a SQL statement explicitly
-# to specify a default database <DBNAME>:
-dbExecute(con, "DATABASE <DBNAME>")
+# to specify a default database:
+dbExecute(con, paste0("DATABASE ", td_database))
 
 # Notes and alternatives:
 # 1. In any connection function, you can specify for the argument: pwd=getPass()

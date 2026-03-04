@@ -108,11 +108,12 @@ if (class(inputDF) == "try-error") {
 
 suppressPackageStartupMessages(library("randomForest"))
 
-# Before you execute the following statement, replace <DBNAME> with the
-# database name in the target Vantage Advanced SQL Engine where the .Rds
-# R model file was saved in the bottom of Section 1 of the Use Case [1]
-# segment in the "R_Py_TechBytes-Part_4-Demo.r" file.
-ScoreModel <- readRDS("./<DBNAME>/RFmodel.rds")
+# The database name for the model file location can be specified via the
+# TD_DATABASE environment variable, or defaults to the placeholder <DBNAME>.
+# Before you execute, either set the TD_DATABASE environment variable or
+# replace the database name below with the target Vantage system database name.
+db_name <- Sys.getenv("TD_DATABASE", unset = "<DBNAME>")
+ScoreModel <- readRDS(paste0("./", db_name, "/RFmodel.rds"))
 
 Predicted <- predict(ScoreModel, newdata=inputDF, type="vote")
 

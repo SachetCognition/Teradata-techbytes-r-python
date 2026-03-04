@@ -66,6 +66,10 @@
 ################################################################################
 
 # Load teradataml and dependency packages
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import config
 from teradataml import create_context, DataFrame, get_context, copy_to_sql, in_schema
 from teradataml.dataframe.sql_functions import case
 from teradataml import XGBoost, XGBoostPredict, DecisionForest, DecisionForestEvaluator, DecisionForestPredict, ConfusionMatrix
@@ -124,7 +128,7 @@ def draw_box_plot(data, plotColumnName, xTicksColumnName, xLabel = None, yLabel 
 # for Python). Before you execute the following statement, replace the variables
 # <HOSTNAME>, <UID> and <PWD> with your target Vantage system hostname (or
 # IP address), and your database user ID and password, respectively.
-td_context = create_context(host="<HOSTNAME>", username="<UID>", password="<PWD>")
+td_context = create_context(host=config.TD_HOST, username=config.TD_USER, password=config.TD_PASSWORD)
 
 # Notes and alternatives:
 # 1. In any connection function, you can specify for an argument the getpass()
@@ -156,13 +160,13 @@ td_context = create_context(host="<HOSTNAME>", username="<UID>", password="<PWD>
 # where the corresponding table resides.
 # Note: Use the in_schema() function only if tables reside in a database
 #       <DBNAME> other than the default database of the connected user.
-tdCustomer = DataFrame(in_schema("<DBNAME>", "Customer"))
+tdCustomer = DataFrame(in_schema(config.TD_DATABASE, "Customer"))
 # Using to_pandas() for a cleaner display format:
 tdCustomer.to_pandas().head(10)
-tdAccounts = DataFrame(in_schema("<DBNAME>", "Accounts"))
+tdAccounts = DataFrame(in_schema(config.TD_DATABASE, "Accounts"))
 # Using to_pandas() for a cleaner display format:
 tdAccounts.to_pandas().head(10)
-tdTransactions = DataFrame(in_schema("<DBNAME>", "Transactions"))
+tdTransactions = DataFrame(in_schema(config.TD_DATABASE, "Transactions"))
 # Using to_pandas() for a cleaner display format:
 tdTransactions.to_pandas().head(10)
 
@@ -462,10 +466,10 @@ T1.cust_id  AS cust_id \
 ,COUNT(CASE WHEN ((EXTRACT(MONTH FROM T3.tran_date) + 2) / 3) = 2 THEN T3.tran_id ELSE NULL END) AS q2_trans_cnt \
 ,COUNT(CASE WHEN ((EXTRACT(MONTH FROM T3.tran_date) + 2) / 3) = 3 THEN T3.tran_id ELSE NULL END) AS q3_trans_cnt \
 ,COUNT(CASE WHEN ((EXTRACT(MONTH FROM T3.tran_date) + 2) / 3) = 4 THEN T3.tran_id ELSE NULL END) AS q4_trans_cnt \
-FROM <DBNAME>.Customer AS T1 \
-LEFT OUTER JOIN <DBNAME>.Accounts AS T2 \
+FROM " + config.TD_DATABASE + ".Customer AS T1 \
+LEFT OUTER JOIN " + config.TD_DATABASE + ".Accounts AS T2 \
 ON T1.cust_id = T2.cust_id \
-LEFT OUTER JOIN <DBNAME>.Transactions AS T3 \
+LEFT OUTER JOIN " + config.TD_DATABASE + ".Transactions AS T3 \
 ON T2.acct_nbr = T3.acct_nbr \
 GROUP BY T1.cust_id"
 
