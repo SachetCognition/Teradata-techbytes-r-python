@@ -12,16 +12,17 @@ import zipfile
 
 import pandas as pd
 
-# Allow importing config from the repo root
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
-
 # Try to load from .env file if python-dotenv is available
+# This MUST happen before importing config, since config.py reads os.environ at import time.
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 except ImportError:
     pass
+
+# Allow importing config from the repo root
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
 
 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "R_Py-Input_Tables")

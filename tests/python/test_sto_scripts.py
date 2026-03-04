@@ -109,7 +109,7 @@ class TestStoRFScore:
 
         # Replace the model loading part to avoid file-not-found
         code = code.replace(
-            "fIn = open('<DBNAME>/RFmodel_py.out', 'rb')",
+            "fIn = open(_db_name + '/RFmodel_py.out', 'rb')   # 'rb' for reading binary file",
             "# MODEL LOADING SKIPPED FOR TEST"
         )
         code = code.replace("classifierPklB64 = fIn.read()", "pass")

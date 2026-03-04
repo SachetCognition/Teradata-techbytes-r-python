@@ -178,6 +178,11 @@ def build_ads(customer_df, accounts_df, transactions_df):
         'ck_tran_amt': 'mean',
         'sv_tran_amt': 'mean',
         'cc_tran_amt': 'mean',
+        # Note: We use 'sum' on the binary 0/1 quarterly indicators to count
+        # transactions per quarter. This matches the original SQL logic which uses
+        # COUNT(CASE WHEN month IN (...) THEN tran_id ELSE NULL END).
+        # The teradataml code uses 'count' which counts all non-null rows (same
+        # value for all 4 quarters). 'sum' is semantically correct per the SQL.
         'q1_trans': 'sum',
         'q2_trans': 'sum',
         'q3_trans': 'sum',
