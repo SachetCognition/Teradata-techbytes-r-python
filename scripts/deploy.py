@@ -19,12 +19,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
 
+def execute_sql(sql):
+    """Execute a raw SQL statement using the current teradataml context."""
+    from teradataml import get_context
+    from sqlalchemy import text
+    with get_context().connect() as conn:
+        return conn.execute(text(sql))
+
+
 def get_table_count(db, table_name):
     """Get row count for a table, return -1 if table doesn't exist."""
-    from teradataml import DataFrame as TDDataFrame, in_schema, get_context
     try:
-        td_df = TDDataFrame(in_schema(db, table_name))
-        return len(td_df)
+        result = execute_sql(f"SELECT COUNT(*) FROM {db}.{table_name}")
+        row = result.fetchone()
+        return row[0] if row else -1
     except Exception:
         return -1
 
@@ -38,352 +46,261 @@ def step_load_data():
     return load_data()
 
 
+def _build_acct_features_sql(db):
+    """SQL fragment for account-level features aggregated by cust_id."""
+    return f"""
+    SELECT
+        a.cust_id,
+        MAX(CASE WHEN a.acct_type = 'CK' THEN 1 ELSE 0 END) AS ck_acct_ind,
+        MAX(CASE WHEN a.acct_type = 'SV' THEN 1 ELSE 0 END) AS sv_acct_ind,
+        MAX(CASE WHEN a.acct_type = 'CC' THEN 1 ELSE 0 END) AS cc_acct_ind,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'CK'
+            THEN a.starting_balance + a.ending_balance ELSE 0 END AS FLOAT)) AS FLOAT) AS ck_avg_bal,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'SV'
+            THEN a.starting_balance + a.ending_balance ELSE 0 END AS FLOAT)) AS FLOAT) AS sv_avg_bal,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'CC'
+            THEN a.starting_balance + a.ending_balance ELSE 0 END AS FLOAT)) AS FLOAT) AS cc_avg_bal
+    FROM {db}.Accounts a
+    GROUP BY a.cust_id
+    """
+
+
+def _build_tran_features_sql(db):
+    """SQL fragment for transaction-level features aggregated by cust_id."""
+    return f"""
+    SELECT
+        a.cust_id,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'CK'
+            THEN t.principal_amt + t.interest_amt ELSE 0 END AS FLOAT)) AS FLOAT) AS ck_avg_tran_amt,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'SV'
+            THEN t.principal_amt + t.interest_amt ELSE 0 END AS FLOAT)) AS FLOAT) AS sv_avg_tran_amt,
+        CAST(AVG(CAST(CASE WHEN a.acct_type = 'CC'
+            THEN t.principal_amt + t.interest_amt ELSE 0 END AS FLOAT)) AS FLOAT) AS cc_avg_tran_amt,
+        COUNT(CASE WHEN EXTRACT(MONTH FROM t.tran_date) IN (1,2,3)
+            THEN t.tran_id ELSE NULL END) AS q1_trans_cnt,
+        COUNT(CASE WHEN EXTRACT(MONTH FROM t.tran_date) IN (4,5,6)
+            THEN t.tran_id ELSE NULL END) AS q2_trans_cnt,
+        COUNT(CASE WHEN EXTRACT(MONTH FROM t.tran_date) IN (7,8,9)
+            THEN t.tran_id ELSE NULL END) AS q3_trans_cnt,
+        COUNT(CASE WHEN EXTRACT(MONTH FROM t.tran_date) IN (10,11,12)
+            THEN t.tran_id ELSE NULL END) AS q4_trans_cnt
+    FROM {db}.Accounts a
+    LEFT JOIN {db}.Transactions t ON CAST(a.acct_nbr AS VARCHAR(20)) = t.acct_nbr
+    GROUP BY a.cust_id
+    """
+
+
 def step_create_ads(db):
-    """Step 2: Run Part 3 feature engineering to create ADS_Py table."""
+    """Step 2: Create ADS_Py via SQL CTAS using staged temp tables.
+
+    Uses pure SQL with CAST to FLOAT to avoid Teradata DECIMAL precision
+    overflow errors that occur when using teradataml copy_to_sql with
+    complex aggregation expressions.
+    """
     print("\n" + "=" * 60)
     print("STEP 2: Creating ADS_Py (Part 3 feature engineering)")
     print("=" * 60)
 
-    from teradataml import (
-        create_context, DataFrame as TDDataFrame, get_context,
-        copy_to_sql, in_schema
-    )
-    from teradataml.dataframe.sql_functions import case
-    from sqlalchemy.sql.expression import extract
+    # Build account and transaction feature temp tables, then join with
+    # customer features to produce the final ADS_Py table.
+    for tmp in ["tmp_acct_features", "tmp_tran_features", "tmp_cust_features", "ADS_Py"]:
+        try:
+            execute_sql(f"DROP TABLE {db}.{tmp}")
+        except Exception:
+            pass
 
-    tdCustomer = TDDataFrame(in_schema(db, "Customer"))
-    tdAccounts = TDDataFrame(in_schema(db, "Accounts"))
-    tdTransactions = TDDataFrame(in_schema(db, "Transactions"))
+    print("  Building account features...")
+    execute_sql(f"CREATE TABLE {db}.tmp_acct_features AS ({_build_acct_features_sql(db)}) WITH DATA")
 
-    # Customer features
-    cust = tdCustomer.assign(
-        female=case([(tdCustomer.gender == "F", 1)], else_=0),
-        single=case([(tdCustomer.marital_status == 1, 1)], else_=0),
-        married=case([(tdCustomer.marital_status == 2, 1)], else_=0),
-        separated=case([(tdCustomer.marital_status == 3, 1)], else_=0),
-        ca_resident=case([(tdCustomer.state_code == "CA", 1)], else_=0),
-        ny_resident=case([(tdCustomer.state_code == "NY", 1)], else_=0),
-        tx_resident=case([(tdCustomer.state_code == "TX", 1)], else_=0),
-        il_resident=case([(tdCustomer.state_code == "IL", 1)], else_=0),
-        az_resident=case([(tdCustomer.state_code == "AZ", 1)], else_=0),
-        oh_resident=case([(tdCustomer.state_code == "OH", 1)], else_=0),
-    )
+    print("  Building transaction features...")
+    execute_sql(f"CREATE TABLE {db}.tmp_tran_features AS ({_build_tran_features_sql(db)}) WITH DATA")
 
-    # Account features
-    acct_balance = tdAccounts.starting_balance + tdAccounts.ending_balance
-    acct = tdAccounts.assign(
-        ck_acct=case([(tdAccounts.acct_type == "CK", 1)], else_=0),
-        sv_acct=case([(tdAccounts.acct_type == "SV", 1)], else_=0),
-        cc_acct=case([(tdAccounts.acct_type == "CC", 1)], else_=0),
-        ck_bal=case([(tdAccounts.acct_type == "CK", acct_balance.expression)], else_=0),
-        sv_bal=case([(tdAccounts.acct_type == "SV", acct_balance.expression)], else_=0),
-        cc_bal=case([(tdAccounts.acct_type == "CC", acct_balance.expression)], else_=0),
-    )
+    print("  Building customer features...")
+    execute_sql(f"""
+    CREATE TABLE {db}.tmp_cust_features AS (
+        SELECT
+            c.cust_id,
+            CAST(c.income AS FLOAT) AS tot_income,
+            c.age AS tot_age,
+            c.years_with_bank AS tot_cust_years,
+            c.nbr_children AS tot_children,
+            CASE WHEN c.gender = 'F' THEN 1 ELSE 0 END AS female_ind,
+            CASE WHEN c.marital_status = 1 THEN 1 ELSE 0 END AS single_ind,
+            CASE WHEN c.marital_status = 2 THEN 1 ELSE 0 END AS married_ind,
+            CASE WHEN c.marital_status = 3 THEN 1 ELSE 0 END AS separated_ind,
+            CASE WHEN c.state_code = 'CA' THEN 1 ELSE 0 END AS ca_resident_ind,
+            CASE WHEN c.state_code = 'NY' THEN 1 ELSE 0 END AS ny_resident_ind,
+            CASE WHEN c.state_code = 'TX' THEN 1 ELSE 0 END AS tx_resident_ind,
+            CASE WHEN c.state_code = 'IL' THEN 1 ELSE 0 END AS il_resident_ind,
+            CASE WHEN c.state_code = 'AZ' THEN 1 ELSE 0 END AS az_resident_ind,
+            CASE WHEN c.state_code = 'OH' THEN 1 ELSE 0 END AS oh_resident_ind,
+            CASE WHEN c.state_code IN ('CA','NY','TX','IL','AZ','OH')
+                THEN TRIM(c.state_code) ELSE 'OTHER' END AS statecode
+        FROM {db}.Customer c
+    ) WITH DATA
+    """)
 
-    # Transaction features
-    acct_mon = extract('month', tdTransactions.tran_date.expression).expression
-    trans = tdTransactions.assign(
-        q1_trans=case([(acct_mon == "1", 1), (acct_mon == "2", 1), (acct_mon == "3", 1)], else_=0),
-        q2_trans=case([(acct_mon == "4", 1), (acct_mon == "5", 1), (acct_mon == "6", 1)], else_=0),
-        q3_trans=case([(acct_mon == "7", 1), (acct_mon == "8", 1), (acct_mon == "9", 1)], else_=0),
-        q4_trans=case([(acct_mon == "10", 1), (acct_mon == "11", 1), (acct_mon == "12", 1)], else_=0),
-    )
+    print("  Joining into ADS_Py...")
+    execute_sql(f"""
+    CREATE TABLE {db}.ADS_Py AS (
+        SELECT
+            cf.cust_id,
+            cf.tot_income, cf.tot_age, cf.tot_cust_years, cf.tot_children,
+            cf.female_ind, cf.single_ind, cf.married_ind, cf.separated_ind,
+            cf.ca_resident_ind, cf.ny_resident_ind, cf.tx_resident_ind,
+            cf.il_resident_ind, cf.az_resident_ind, cf.oh_resident_ind,
+            COALESCE(af.ck_acct_ind, 0) AS ck_acct_ind,
+            COALESCE(af.sv_acct_ind, 0) AS sv_acct_ind,
+            COALESCE(af.cc_acct_ind, 0) AS cc_acct_ind,
+            COALESCE(af.ck_avg_bal, 0.0) AS ck_avg_bal,
+            COALESCE(af.sv_avg_bal, 0.0) AS sv_avg_bal,
+            COALESCE(af.cc_avg_bal, 0.0) AS cc_avg_bal,
+            COALESCE(tf.ck_avg_tran_amt, 0.0) AS ck_avg_tran_amt,
+            COALESCE(tf.sv_avg_tran_amt, 0.0) AS sv_avg_tran_amt,
+            COALESCE(tf.cc_avg_tran_amt, 0.0) AS cc_avg_tran_amt,
+            COALESCE(tf.q1_trans_cnt, 0) AS q1_trans_cnt,
+            COALESCE(tf.q2_trans_cnt, 0) AS q2_trans_cnt,
+            COALESCE(tf.q3_trans_cnt, 0) AS q3_trans_cnt,
+            COALESCE(tf.q4_trans_cnt, 0) AS q4_trans_cnt
+        FROM {db}.tmp_cust_features cf
+        LEFT JOIN {db}.tmp_acct_features af ON cf.cust_id = af.cust_id
+        LEFT JOIN {db}.tmp_tran_features tf ON cf.cust_id = tf.cust_id
+    ) WITH DATA
+    """)
 
-    # Join accounts and transactions
-    acct_trans_cols = [
-        'cust_id', 'acct_type', 'starting_balance', 'ending_balance',
-        'acct_acct_nbr', 'principal_amt', 'interest_amt', 'tran_id',
-        'tran_date', 'q1_trans', 'q2_trans', 'q3_trans', 'q4_trans',
-        'cc_acct', 'cc_bal', 'ck_acct', 'ck_bal', 'sv_acct', 'sv_bal'
-    ]
-    acct_trans_tmp = acct.join(
-        other=trans, on=[acct.acct_nbr == trans.acct_nbr],
-        how="left", lsuffix="acct", rsuffix="trans"
-    ).select(acct_trans_cols)
-
-    acct_trans_amt = trans.principal_amt + trans.interest_amt
-    acct_trans = acct_trans_tmp.assign(
-        ck_tran_amt=case([(acct_trans_tmp.acct_type == "CK", acct_trans_amt.expression)], else_=0),
-        sv_tran_amt=case([(acct_trans_tmp.acct_type == "SV", acct_trans_amt.expression)], else_=0),
-        cc_tran_amt=case([(acct_trans_tmp.acct_type == "CC", acct_trans_amt.expression)], else_=0),
-    )
-
-    # Join with customer
-    ADS_Py_join_tmp = cust.join(
-        other=acct_trans, on=[cust.cust_id == acct_trans.cust_id],
-        how="left", lsuffix="cust", rsuffix="actr"
-    )
-
-    ADS_Py_join = ADS_Py_join_tmp.assign(
-        drop_columns=True,
-        cust_id=ADS_Py_join_tmp.cust_cust_id,
-        income=ADS_Py_join_tmp.income,
-        age=ADS_Py_join_tmp.age,
-        years_with_bank=ADS_Py_join_tmp.years_with_bank,
-        nbr_children=ADS_Py_join_tmp.nbr_children,
-        female=ADS_Py_join_tmp.female,
-        single=ADS_Py_join_tmp.single,
-        married=ADS_Py_join_tmp.married,
-        separated=ADS_Py_join_tmp.separated,
-        ca_resident=ADS_Py_join_tmp.ca_resident,
-        ny_resident=ADS_Py_join_tmp.ny_resident,
-        tx_resident=ADS_Py_join_tmp.tx_resident,
-        il_resident=ADS_Py_join_tmp.il_resident,
-        az_resident=ADS_Py_join_tmp.az_resident,
-        oh_resident=ADS_Py_join_tmp.oh_resident,
-        ck_acct=case([(ADS_Py_join_tmp.ck_acct == None, 0)], else_=ADS_Py_join_tmp.ck_acct),
-        sv_acct=case([(ADS_Py_join_tmp.sv_acct == None, 0)], else_=ADS_Py_join_tmp.sv_acct),
-        cc_acct=case([(ADS_Py_join_tmp.cc_acct == None, 0)], else_=ADS_Py_join_tmp.cc_acct),
-        ck_bal=case([(ADS_Py_join_tmp.ck_bal == None, 0)], else_=ADS_Py_join_tmp.ck_bal),
-        sv_bal=case([(ADS_Py_join_tmp.sv_bal == None, 0)], else_=ADS_Py_join_tmp.sv_bal),
-        cc_bal=case([(ADS_Py_join_tmp.cc_bal == None, 0)], else_=ADS_Py_join_tmp.cc_bal),
-        ck_tran_amt=case([(ADS_Py_join_tmp.ck_tran_amt == None, 0)], else_=ADS_Py_join_tmp.ck_tran_amt),
-        sv_tran_amt=case([(ADS_Py_join_tmp.sv_tran_amt == None, 0)], else_=ADS_Py_join_tmp.sv_tran_amt),
-        cc_tran_amt=case([(ADS_Py_join_tmp.cc_tran_amt == None, 0)], else_=ADS_Py_join_tmp.cc_tran_amt),
-        q1_trans=case([(ADS_Py_join_tmp.q1_trans == None, 0)], else_=ADS_Py_join_tmp.q1_trans),
-        q2_trans=case([(ADS_Py_join_tmp.q2_trans == None, 0)], else_=ADS_Py_join_tmp.q2_trans),
-        q3_trans=case([(ADS_Py_join_tmp.q3_trans == None, 0)], else_=ADS_Py_join_tmp.q3_trans),
-        q4_trans=case([(ADS_Py_join_tmp.q4_trans == None, 0)], else_=ADS_Py_join_tmp.q4_trans),
-    )
-
-    # Aggregate
-    ADS_Py = ADS_Py_join.groupby("cust_id").agg({
-        "income": "min", "age": "min", "years_with_bank": "min",
-        "nbr_children": "min", "single": "min", "female": "min",
-        "married": "min", "separated": "min",
-        "ca_resident": "max", "ny_resident": "max", "tx_resident": "max",
-        "il_resident": "max", "az_resident": "max", "oh_resident": "max",
-        "ck_acct": "max", "sv_acct": "max", "cc_acct": "max",
-        "ck_bal": "mean", "sv_bal": "mean", "cc_bal": "mean",
-        "ck_tran_amt": "mean", "sv_tran_amt": "mean", "cc_tran_amt": "mean",
-        "q1_trans": "count", "q2_trans": "count", "q3_trans": "count", "q4_trans": "count",
-    })
-
-    columns = [
-        'cust_id', 'tot_income', 'tot_age', 'tot_cust_years', 'tot_children',
-        'female_ind', 'single_ind', 'married_ind', 'separated_ind',
-        'ca_resident_ind', 'ny_resident_ind', 'tx_resident_ind',
-        'il_resident_ind', 'az_resident_ind', 'oh_resident_ind',
-        'ck_acct_ind', 'sv_acct_ind', 'cc_acct_ind',
-        'ck_avg_bal', 'sv_avg_bal', 'cc_avg_bal',
-        'ck_avg_tran_amt', 'sv_avg_tran_amt', 'cc_avg_tran_amt',
-        'q1_trans_cnt', 'q2_trans_cnt', 'q3_trans_cnt', 'q4_trans_cnt',
-    ]
-
-    ADS_Py = ADS_Py.assign(
-        drop_columns=True,
-        cust_id=ADS_Py.cust_id,
-        tot_income=ADS_Py.min_income, tot_age=ADS_Py.min_age,
-        tot_cust_years=ADS_Py.min_years_with_bank,
-        tot_children=ADS_Py.min_nbr_children,
-        female_ind=ADS_Py.min_female, single_ind=ADS_Py.min_single,
-        married_ind=ADS_Py.min_married, separated_ind=ADS_Py.min_separated,
-        ca_resident_ind=ADS_Py.max_ca_resident,
-        ny_resident_ind=ADS_Py.max_ny_resident,
-        tx_resident_ind=ADS_Py.max_tx_resident,
-        il_resident_ind=ADS_Py.max_il_resident,
-        az_resident_ind=ADS_Py.max_az_resident,
-        oh_resident_ind=ADS_Py.max_oh_resident,
-        ck_acct_ind=ADS_Py.max_ck_acct, sv_acct_ind=ADS_Py.max_sv_acct,
-        cc_acct_ind=ADS_Py.max_cc_acct,
-        ck_avg_bal=ADS_Py.mean_ck_bal, sv_avg_bal=ADS_Py.mean_sv_bal,
-        cc_avg_bal=ADS_Py.mean_cc_bal,
-        ck_avg_tran_amt=ADS_Py.mean_ck_tran_amt,
-        sv_avg_tran_amt=ADS_Py.mean_sv_tran_amt,
-        cc_avg_tran_amt=ADS_Py.mean_cc_tran_amt,
-        q1_trans_cnt=ADS_Py.count_q1_trans, q2_trans_cnt=ADS_Py.count_q2_trans,
-        q3_trans_cnt=ADS_Py.count_q3_trans, q4_trans_cnt=ADS_Py.count_q4_trans,
-    ).select(columns)
-
-    # Persist
-    try:
-        get_context().execute(f"DROP TABLE {db}.ADS_Py")
-    except Exception:
-        pass
-    copy_to_sql(ADS_Py, schema_name=db, table_name="ADS_Py", if_exists="replace")
     count = get_table_count(db, "ADS_Py")
     print(f"  ADS_Py created with {count} rows.")
+
+    # Clean up temp tables
+    for tmp in ["tmp_acct_features", "tmp_tran_features"]:
+        try:
+            execute_sql(f"DROP TABLE {db}.{tmp}")
+        except Exception:
+            pass
+
     return count > 0
 
 
 def step_create_multimodel_tables(db):
-    """Step 3: Create ADS_Py2, MultiModelTrain_Py, MultiModelTest_Py."""
+    """Step 3: Create ADS_Py2, MultiModelTrain_Py, MultiModelTest_Py.
+
+    Uses the same staged-SQL approach as step_create_ads. ADS_Py2 uses
+    statecode (recoded state) instead of individual state indicator columns.
+    Train/test split uses deterministic cust_id MOD for ~60/40 partition.
+    """
     print("\n" + "=" * 60)
     print("STEP 3: Creating multi-model tables (Part 5 Use Case 2)")
     print("=" * 60)
 
-    from teradataml import (
-        DataFrame as TDDataFrame, get_context, copy_to_sql, in_schema
-    )
-    from teradataml.dataframe.sql_functions import case
-    from sqlalchemy.sql.expression import extract
+    for tbl in ["ADS_Py2", "MultiModelTrain_Py", "MultiModelTest_Py"]:
+        try:
+            execute_sql(f"DROP TABLE {db}.{tbl}")
+        except Exception:
+            pass
 
-    tdCustomer = TDDataFrame(in_schema(db, "Customer"))
-    tdAccounts = TDDataFrame(in_schema(db, "Accounts"))
-    tdTransactions = TDDataFrame(in_schema(db, "Transactions"))
+    # Re-use the tmp_cust_features table from step_create_ads if it still
+    # exists; otherwise the table was already created above.
+    cust_exists = get_table_count(db, "tmp_cust_features")
+    if cust_exists < 0:
+        print("  Rebuilding customer features...")
+        execute_sql(f"""
+        CREATE TABLE {db}.tmp_cust_features AS (
+            SELECT
+                c.cust_id,
+                CAST(c.income AS FLOAT) AS tot_income,
+                c.age AS tot_age,
+                c.years_with_bank AS tot_cust_years,
+                c.nbr_children AS tot_children,
+                CASE WHEN c.gender = 'F' THEN 1 ELSE 0 END AS female_ind,
+                CASE WHEN c.marital_status = 1 THEN 1 ELSE 0 END AS single_ind,
+                CASE WHEN c.marital_status = 2 THEN 1 ELSE 0 END AS married_ind,
+                CASE WHEN c.marital_status = 3 THEN 1 ELSE 0 END AS separated_ind,
+                CASE WHEN c.state_code = 'CA' THEN 1 ELSE 0 END AS ca_resident_ind,
+                CASE WHEN c.state_code = 'NY' THEN 1 ELSE 0 END AS ny_resident_ind,
+                CASE WHEN c.state_code = 'TX' THEN 1 ELSE 0 END AS tx_resident_ind,
+                CASE WHEN c.state_code = 'IL' THEN 1 ELSE 0 END AS il_resident_ind,
+                CASE WHEN c.state_code = 'AZ' THEN 1 ELSE 0 END AS az_resident_ind,
+                CASE WHEN c.state_code = 'OH' THEN 1 ELSE 0 END AS oh_resident_ind,
+                CASE WHEN c.state_code IN ('CA','NY','TX','IL','AZ','OH')
+                    THEN TRIM(c.state_code) ELSE 'OTHER' END AS statecode
+            FROM {db}.Customer c
+        ) WITH DATA
+        """)
 
-    # Customer features with statecode
-    cust = tdCustomer.assign(
-        drop_columns=True,
-        cust_id=tdCustomer.cust_id, income=tdCustomer.income,
-        age=tdCustomer.age, gender=tdCustomer.gender,
-        years_with_bank=tdCustomer.years_with_bank,
-        nbr_children=tdCustomer.nbr_children,
-        marital_status=tdCustomer.marital_status,
-        state_code=tdCustomer.state_code,
-        female=case([(tdCustomer.gender == "F", 1)], else_=0),
-        single=case([(tdCustomer.marital_status == 1, 1)], else_=0),
-        married=case([(tdCustomer.marital_status == 2, 1)], else_=0),
-        separated=case([(tdCustomer.marital_status == 3, 1)], else_=0),
-        statecode=case([
-            (tdCustomer.state_code == "CA", "CA"),
-            (tdCustomer.state_code == "NY", "NY"),
-            (tdCustomer.state_code == "TX", "TX"),
-            (tdCustomer.state_code == "IL", "IL"),
-            (tdCustomer.state_code == "AZ", "AZ"),
-            (tdCustomer.state_code == "OH", "OH"),
-        ], else_="OTHER"),
-    )
+    acct_exists = get_table_count(db, "tmp_acct_features")
+    if acct_exists < 0:
+        print("  Rebuilding account features...")
+        execute_sql(f"CREATE TABLE {db}.tmp_acct_features AS ({_build_acct_features_sql(db)}) WITH DATA")
 
-    acct_balance = tdAccounts.starting_balance + tdAccounts.ending_balance
-    acct = tdAccounts.assign(
-        ck_acct=case([(tdAccounts.acct_type == "CK", 1)], else_=0),
-        sv_acct=case([(tdAccounts.acct_type == "SV", 1)], else_=0),
-        cc_acct=case([(tdAccounts.acct_type == "CC", 1)], else_=0),
-        ck_bal=case([(tdAccounts.acct_type == "CK", acct_balance.expression)], else_=0),
-        sv_bal=case([(tdAccounts.acct_type == "SV", acct_balance.expression)], else_=0),
-        cc_bal=case([(tdAccounts.acct_type == "CC", acct_balance.expression)], else_=0),
-    )
+    tran_exists = get_table_count(db, "tmp_tran_features")
+    if tran_exists < 0:
+        print("  Rebuilding transaction features...")
+        execute_sql(f"CREATE TABLE {db}.tmp_tran_features AS ({_build_tran_features_sql(db)}) WITH DATA")
 
-    acct_mon = extract('month', tdTransactions.tran_date.expression).expression
-    trans = tdTransactions.assign(
-        q1_trans=case([(acct_mon == "1", 1), (acct_mon == "2", 1), (acct_mon == "3", 1)], else_=0),
-        q2_trans=case([(acct_mon == "4", 1), (acct_mon == "5", 1), (acct_mon == "6", 1)], else_=0),
-        q3_trans=case([(acct_mon == "7", 1), (acct_mon == "8", 1), (acct_mon == "9", 1)], else_=0),
-        q4_trans=case([(acct_mon == "10", 1), (acct_mon == "11", 1), (acct_mon == "12", 1)], else_=0),
-    )
+    print("  Creating ADS_Py2 (with statecode)...")
+    execute_sql(f"""
+    CREATE TABLE {db}.ADS_Py2 AS (
+        SELECT
+            cf.cust_id,
+            cf.tot_income, cf.tot_age, cf.tot_cust_years, cf.tot_children,
+            cf.female_ind, cf.single_ind, cf.married_ind, cf.separated_ind,
+            cf.statecode,
+            COALESCE(af.ck_acct_ind, 0) AS ck_acct_ind,
+            COALESCE(af.sv_acct_ind, 0) AS sv_acct_ind,
+            COALESCE(af.cc_acct_ind, 0) AS cc_acct_ind,
+            COALESCE(af.ck_avg_bal, 0.0) AS ck_avg_bal,
+            COALESCE(af.sv_avg_bal, 0.0) AS sv_avg_bal,
+            COALESCE(af.cc_avg_bal, 0.0) AS cc_avg_bal,
+            COALESCE(tf.ck_avg_tran_amt, 0.0) AS ck_avg_tran_amt,
+            COALESCE(tf.sv_avg_tran_amt, 0.0) AS sv_avg_tran_amt,
+            COALESCE(tf.cc_avg_tran_amt, 0.0) AS cc_avg_tran_amt,
+            COALESCE(tf.q1_trans_cnt, 0) AS q1_trans_cnt,
+            COALESCE(tf.q2_trans_cnt, 0) AS q2_trans_cnt,
+            COALESCE(tf.q3_trans_cnt, 0) AS q3_trans_cnt,
+            COALESCE(tf.q4_trans_cnt, 0) AS q4_trans_cnt
+        FROM {db}.tmp_cust_features cf
+        LEFT JOIN {db}.tmp_acct_features af ON cf.cust_id = af.cust_id
+        LEFT JOIN {db}.tmp_tran_features tf ON cf.cust_id = tf.cust_id
+    ) WITH DATA
+    """)
 
-    acct_trans_cols = [
-        'cust_id', 'acct_type', 'starting_balance', 'ending_balance',
-        'acct_acct_nbr', 'principal_amt', 'interest_amt', 'tran_id',
-        'tran_date', 'q1_trans', 'q2_trans', 'q3_trans', 'q4_trans',
-        'cc_acct', 'cc_bal', 'ck_acct', 'ck_bal', 'sv_acct', 'sv_bal'
-    ]
-    acct_trans_tmp = acct.join(
-        other=trans, on=[acct.acct_nbr == trans.acct_nbr],
-        how="left", lsuffix="acct", rsuffix="trans"
-    ).select(acct_trans_cols)
+    # Get ADS_Py2 column list for the train/test CTAS
+    from teradataml import get_context
+    from sqlalchemy import text
+    with get_context().connect() as conn:
+        result = conn.execute(text(
+            f"SELECT ColumnName FROM DBC.ColumnsV "
+            f"WHERE DatabaseName = '{db}' AND TableName = 'ADS_Py2' "
+            f"ORDER BY ColumnId"
+        ))
+        ads2_cols = ", ".join(row[0].strip() for row in result.fetchall())
 
-    acct_trans_amt = trans.principal_amt + trans.interest_amt
-    acct_trans = acct_trans_tmp.assign(
-        ck_tran_amt=case([(acct_trans_tmp.acct_type == "CK", acct_trans_amt.expression)], else_=0),
-        sv_tran_amt=case([(acct_trans_tmp.acct_type == "SV", acct_trans_amt.expression)], else_=0),
-        cc_tran_amt=case([(acct_trans_tmp.acct_type == "CC", acct_trans_amt.expression)], else_=0),
-    )
+    # Train set (~60%) — deterministic split via cust_id MOD
+    print("  Creating MultiModelTrain_Py (~60%)...")
+    execute_sql(f"""
+    CREATE TABLE {db}.MultiModelTrain_Py AS (
+        SELECT {ads2_cols}, 1 AS sample_id
+        FROM {db}.ADS_Py2
+        WHERE MOD(cust_id, 10) < 6
+    ) WITH DATA
+    """)
 
-    ADS_Py2_join_tmp = cust.join(
-        other=acct_trans, on=[cust.cust_id == acct_trans.cust_id],
-        how="left", lsuffix="cust", rsuffix="actr"
-    )
+    # Test set (~40%)
+    print("  Creating MultiModelTest_Py (~40%)...")
+    execute_sql(f"""
+    CREATE TABLE {db}.MultiModelTest_Py AS (
+        SELECT {ads2_cols}, 2 AS sample_id
+        FROM {db}.ADS_Py2
+        WHERE MOD(cust_id, 10) >= 6
+    ) WITH DATA
+    """)
 
-    ADS_Py2_join = ADS_Py2_join_tmp.assign(
-        drop_columns=True,
-        cust_id=ADS_Py2_join_tmp.cust_cust_id,
-        income=ADS_Py2_join_tmp.income, age=ADS_Py2_join_tmp.age,
-        years_with_bank=ADS_Py2_join_tmp.years_with_bank,
-        nbr_children=ADS_Py2_join_tmp.nbr_children,
-        female=ADS_Py2_join_tmp.female,
-        single=ADS_Py2_join_tmp.single,
-        married=ADS_Py2_join_tmp.married,
-        separated=ADS_Py2_join_tmp.separated,
-        statecode=ADS_Py2_join_tmp.statecode,
-        ck_acct=case([(ADS_Py2_join_tmp.ck_acct == None, 0)], else_=ADS_Py2_join_tmp.ck_acct),
-        sv_acct=case([(ADS_Py2_join_tmp.sv_acct == None, 0)], else_=ADS_Py2_join_tmp.sv_acct),
-        cc_acct=case([(ADS_Py2_join_tmp.cc_acct == None, 0)], else_=ADS_Py2_join_tmp.cc_acct),
-        ck_bal=case([(ADS_Py2_join_tmp.ck_bal == None, 0)], else_=ADS_Py2_join_tmp.ck_bal),
-        sv_bal=case([(ADS_Py2_join_tmp.sv_bal == None, 0)], else_=ADS_Py2_join_tmp.sv_bal),
-        cc_bal=case([(ADS_Py2_join_tmp.cc_bal == None, 0)], else_=ADS_Py2_join_tmp.cc_bal),
-        ck_tran_amt=case([(ADS_Py2_join_tmp.ck_tran_amt == None, 0)], else_=ADS_Py2_join_tmp.ck_tran_amt),
-        sv_tran_amt=case([(ADS_Py2_join_tmp.sv_tran_amt == None, 0)], else_=ADS_Py2_join_tmp.sv_tran_amt),
-        cc_tran_amt=case([(ADS_Py2_join_tmp.cc_tran_amt == None, 0)], else_=ADS_Py2_join_tmp.cc_tran_amt),
-        q1_trans=case([(ADS_Py2_join_tmp.q1_trans == None, 0)], else_=ADS_Py2_join_tmp.q1_trans),
-        q2_trans=case([(ADS_Py2_join_tmp.q2_trans == None, 0)], else_=ADS_Py2_join_tmp.q2_trans),
-        q3_trans=case([(ADS_Py2_join_tmp.q3_trans == None, 0)], else_=ADS_Py2_join_tmp.q3_trans),
-        q4_trans=case([(ADS_Py2_join_tmp.q4_trans == None, 0)], else_=ADS_Py2_join_tmp.q4_trans),
-    )
-
-    ADS_Py2 = ADS_Py2_join.groupby("cust_id").agg({
-        "income": "min", "age": "min", "years_with_bank": "min",
-        "nbr_children": "min", "single": "min", "female": "min",
-        "married": "min", "separated": "min", "statecode": "min",
-        "ck_acct": "max", "sv_acct": "max", "cc_acct": "max",
-        "ck_bal": "mean", "sv_bal": "mean", "cc_bal": "mean",
-        "ck_tran_amt": "mean", "sv_tran_amt": "mean", "cc_tran_amt": "mean",
-        "q1_trans": "count", "q2_trans": "count", "q3_trans": "count", "q4_trans": "count",
-    })
-
-    columns = [
-        'cust_id', 'tot_income', 'tot_age', 'tot_cust_years', 'tot_children',
-        'female_ind', 'single_ind', 'married_ind', 'separated_ind',
-        'statecode', 'ck_acct_ind', 'sv_acct_ind', 'cc_acct_ind',
-        'ck_avg_bal', 'sv_avg_bal', 'cc_avg_bal',
-        'ck_avg_tran_amt', 'sv_avg_tran_amt', 'cc_avg_tran_amt',
-        'q1_trans_cnt', 'q2_trans_cnt', 'q3_trans_cnt', 'q4_trans_cnt',
-    ]
-
-    ADS_Py2 = ADS_Py2.assign(
-        drop_columns=True,
-        cust_id=ADS_Py2.cust_id,
-        tot_income=ADS_Py2.min_income, tot_age=ADS_Py2.min_age,
-        tot_cust_years=ADS_Py2.min_years_with_bank,
-        tot_children=ADS_Py2.min_nbr_children,
-        female_ind=ADS_Py2.min_female, single_ind=ADS_Py2.min_single,
-        married_ind=ADS_Py2.min_married, separated_ind=ADS_Py2.min_separated,
-        statecode=ADS_Py2.min_statecode,
-        ck_acct_ind=ADS_Py2.max_ck_acct, sv_acct_ind=ADS_Py2.max_sv_acct,
-        cc_acct_ind=ADS_Py2.max_cc_acct,
-        ck_avg_bal=ADS_Py2.mean_ck_bal, sv_avg_bal=ADS_Py2.mean_sv_bal,
-        cc_avg_bal=ADS_Py2.mean_cc_bal,
-        ck_avg_tran_amt=ADS_Py2.mean_ck_tran_amt,
-        sv_avg_tran_amt=ADS_Py2.mean_sv_tran_amt,
-        cc_avg_tran_amt=ADS_Py2.mean_cc_tran_amt,
-        q1_trans_cnt=ADS_Py2.count_q1_trans, q2_trans_cnt=ADS_Py2.count_q2_trans,
-        q3_trans_cnt=ADS_Py2.count_q3_trans, q4_trans_cnt=ADS_Py2.count_q4_trans,
-    ).select(columns)
-
-    # Persist ADS_Py2
-    try:
-        get_context().execute(f"DROP TABLE {db}.ADS_Py2")
-    except Exception:
-        pass
-    copy_to_sql(ADS_Py2, schema_name=db, table_name="ADS_Py2", if_exists="replace")
-
-    # Create train/test split
-    tdADS_Py2 = TDDataFrame(in_schema(db, "ADS_Py2"))
-    ADS_Train_Test2 = tdADS_Py2.sample(frac=[0.60, 0.40])
-    try:
-        get_context().execute(f"DROP TABLE {db}.ADS_Train_Test2")
-    except Exception:
-        pass
-    copy_to_sql(ADS_Train_Test2, schema_name=db, table_name="ADS_Train_Test2", if_exists="replace")
-
-    tdTrain_Test2 = TDDataFrame(in_schema(db, "ADS_Train_Test2"))
-
-    # Train set
-    MultiModelTrain_Py = tdTrain_Test2[tdTrain_Test2.sampleid == "1"]
-    try:
-        get_context().execute(f"DROP TABLE {db}.MultiModelTrain_Py")
-    except Exception:
-        pass
-    copy_to_sql(MultiModelTrain_Py, schema_name=db, table_name="MultiModelTrain_Py", if_exists="replace")
-
-    # Test set
-    MultiModelTest_Py = tdTrain_Test2[tdTrain_Test2.sampleid == "2"]
-    try:
-        get_context().execute(f"DROP TABLE {db}.MultiModelTest_Py")
-    except Exception:
-        pass
-    copy_to_sql(MultiModelTest_Py, schema_name=db, table_name="MultiModelTest_Py", if_exists="replace")
+    # Clean up all temp tables
+    for tmp in ["tmp_acct_features", "tmp_tran_features", "tmp_cust_features"]:
+        try:
+            execute_sql(f"DROP TABLE {db}.{tmp}")
+        except Exception:
+            pass
 
     for tbl_name in ["ADS_Py2", "MultiModelTrain_Py", "MultiModelTest_Py"]:
         count = get_table_count(db, tbl_name)
