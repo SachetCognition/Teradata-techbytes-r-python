@@ -96,6 +96,10 @@
 # Load teradataml and dependency packages to use in both use cases.
 # For use case [1], also load the sklearn package to create a random forest
 # model on the client.
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+import config
 from teradataml import create_context, DataFrame, get_context, copy_to_sql, in_schema
 from teradataml.dataframe.sql_functions import case
 from sqlalchemy.sql.expression import select, or_, extract, text, join, case as case_when
@@ -113,7 +117,7 @@ import base64
 # for Python. Before you execute the following statement, replace the variables
 # <HOSTNAME>, <UID>, and <PWD> with the target Vantage system hostname, your
 # database user ID, and password, respectively.
-td_context = create_context(host="<HOSTNAME>", username="<UID>", password="<PWD>")
+td_context = create_context(host=config.TD_HOST, username=config.TD_USER, password=config.TD_PASSWORD)
 
 # Notes and alternatives:
 # 1. In any connection function, you can specify for an argument the getpass()
@@ -299,9 +303,9 @@ with open('RFmodel_py.out', 'wb') as fOut:  # Use "wb" to write in binary format
 # Before you execute each one of the following statements, replace the variable
 # <DBNAME> with the target Vantage system database name where the corresponding
 # table resides.
-tdCustomer = DataFrame(in_schema("<DBNAME>", "Customer"))
-tdAccounts = DataFrame(in_schema("<DBNAME>", "Accounts"))
-tdTransactions = DataFrame(in_schema("<DBNAME>", "Transactions"))
+tdCustomer = DataFrame(in_schema(config.TD_DATABASE, "Customer"))
+tdAccounts = DataFrame(in_schema(config.TD_DATABASE, "Accounts"))
+tdTransactions = DataFrame(in_schema(config.TD_DATABASE, "Transactions"))
 
 ###
 ### Data Pre-Processing
@@ -504,14 +508,14 @@ ADS_Py2 = ADS_Py2.assign(drop_columns = True,
 # <DBNAME> with the target Vantage system database name where the corresponding
 # table resides.
 try:
-    get_context().execute("DROP TABLE <DBNAME>.ADS_Py2")
+    get_context().execute("DROP TABLE " + config.TD_DATABASE + ".ADS_Py2")
 except:
     pass
 
-copy_to_sql(ADS_Py2, schema_name="<DBNAME>", table_name="ADS_Py2", if_exists="replace")
+copy_to_sql(ADS_Py2, schema_name=config.TD_DATABASE, table_name="ADS_Py2", if_exists="replace")
 
 # Create a DataFrame and take a glimpse at it.
-tdADS_Py2 = DataFrame(in_schema("<DBNAME>", "ADS_Py2"))
+tdADS_Py2 = DataFrame(in_schema(config.TD_DATABASE, "ADS_Py2"))
 tdADS_Py2.to_pandas().head(10)
 
 ###
@@ -526,14 +530,14 @@ tdADS_Py2.to_pandas().head(10)
 ADS_Train_Test2 = tdADS_Py2.sample(frac = [0.60, 0.40])
 
 try:
-    get_context().execute("DROP TABLE <DBNAME>.ADS_Train_Test2")
+    get_context().execute("DROP TABLE " + config.TD_DATABASE + ".ADS_Train_Test2")
 except:
     pass
 
-copy_to_sql(ADS_Train_Test2, schema_name="<DBNAME>", table_name="ADS_Train_Test2", if_exists="replace")
+copy_to_sql(ADS_Train_Test2, schema_name=config.TD_DATABASE, table_name="ADS_Train_Test2", if_exists="replace")
 
 # Create a DataFrame from_query() and take a glimpse at it
-tdTrain_Test2 = DataFrame(in_schema("<DBNAME>", "ADS_Train_Test2"))
+tdTrain_Test2 = DataFrame(in_schema(config.TD_DATABASE, "ADS_Train_Test2"))
 tdTrain_Test2.to_pandas().head(10)
 
 # Use the 60% sample to train
@@ -544,11 +548,11 @@ MultiModelTrain_Py = tdTrain_Test2[tdTrain_Test2.sampleid == "1"]
 # <DBNAME> with the target Vantage system database name where the corresponding
 # table resides.
 try:
-    get_context().execute("DROP TABLE <DBNAME>.MultiModelTrain_Py")
+    get_context().execute("DROP TABLE " + config.TD_DATABASE + ".MultiModelTrain_Py")
 except:
     pass
 
-copy_to_sql(MultiModelTrain_Py, schema_name="<DBNAME>", table_name="MultiModelTrain_Py", if_exists = "replace")
+copy_to_sql(MultiModelTrain_Py, schema_name=config.TD_DATABASE, table_name="MultiModelTrain_Py", if_exists = "replace")
 
 # Use the 40% sample to test/score
 
@@ -558,11 +562,11 @@ MultiModelTest_Py = tdTrain_Test2[tdTrain_Test2.sampleid == "2"]
 # <DBNAME> with the target Vantage system database name where the corresponding
 # table resides.
 try:
-    get_context().execute("DROP TABLE <DBNAME>.MultiModelTest_Py")
+    get_context().execute("DROP TABLE " + config.TD_DATABASE + ".MultiModelTest_Py")
 except:
     pass
 
-copy_to_sql(MultiModelTest_Py, schema_name="<DBNAME>", table_name="MultiModelTest_Py", if_exists = "replace")
+copy_to_sql(MultiModelTest_Py, schema_name=config.TD_DATABASE, table_name="MultiModelTest_Py", if_exists = "replace")
 
 ###
 ### End of session

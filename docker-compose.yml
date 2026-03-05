@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  deploy:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - TD_HOST=${TD_HOST}
+      - TD_USER=${TD_USER}
+      - TD_PASSWORD=${TD_PASSWORD}
+      - TD_DATABASE=${TD_DATABASE}
+    volumes:
+      - ./R_Py-Input_Tables:/app/R_Py-Input_Tables

@@ -42,6 +42,7 @@
 #  v.1.1     2020-04-02     Added change log; no code changes in present file
 ################################################################################
 
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -135,12 +136,12 @@ df['q4_trans_cnt'] = pd.to_numeric(df['q4_trans_cnt'])
 ###
 ### Load model from input file
 ###
-# Before you execute the following statement, replace <DBNAME> with the
-# database name in the target Vantage Advanced SQL Engine where you have
-# previously uploaded the model file to. This must be the same database
-# name as the <DBNAME> specified in the Use Case [1] segment of the SQL script
-# file "R_Py_TechBytes-Part_5-Demo.sql".
-fIn = open('<DBNAME>/RFmodel_py.out', 'rb')   # 'rb' for reading binary file
+# The database name for the model file location can be specified via the
+# TD_DATABASE environment variable, or defaults to the placeholder <DBNAME>.
+# Before you execute, either set the TD_DATABASE environment variable or
+# replace the database name below with the target Vantage system database name.
+_db_name = os.environ.get('TD_DATABASE', '<DBNAME>')
+fIn = open(_db_name + '/RFmodel_py.out', 'rb')   # 'rb' for reading binary file
 classifierPklB64 = fIn.read()
 fIn.close()
 
