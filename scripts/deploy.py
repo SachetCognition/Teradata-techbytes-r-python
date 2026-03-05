@@ -337,18 +337,27 @@ def main():
     db = config.TD_DATABASE
 
     from teradataml import create_context
-    print(f"Connecting to Teradata at {config.TD_HOST}...")
-    create_context(host=config.TD_HOST, username=config.TD_USER, password=config.TD_PASSWORD)
-    print("  Connected.")
-
     if not args.skip_load:
+        # step_load_data -> load_data() creates its own context, so skip
+        # creating one here to avoid orphaning a connection.
         step_load_data()
+    else:
+        print(f"Connecting to Teradata at {config.TD_HOST}...")
+        create_context(host=config.TD_HOST, username=config.TD_USER, password=config.TD_PASSWORD)
+        print("  Connected.")
 
     if not args.skip_ads:
         step_create_ads(db)
 
     if not args.skip_multimodel:
         step_create_multimodel_tables(db)
+    else:
+        # Clean up tmp_cust_features left by step_create_ads when
+        # the multimodel step (which normally cleans it) is skipped.
+        try:
+            execute_sql(f"DROP TABLE {db}.tmp_cust_features")
+        except Exception:
+            pass
 
     report_tables(db)
 
